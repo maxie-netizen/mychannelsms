@@ -1,16 +1,17 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+import threading
+import time
+import signal
+from datetime import datetime
 from flask import Flask, jsonify, request, render_template
 from dotenv import load_dotenv
-from telegram import Bot, Update
+from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from scraper import create_scraper
 from otp_filter import otp_filter
 from utils import format_otp_message, format_multiple_otps, get_status_message
-import threading
-import time
 
 # Load environment variables
 load_dotenv()
@@ -46,7 +47,7 @@ telegram_app = None
 scraper = None
 
 # Telegram Command Handlers
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     welcome_message = """🤖 <b>Telegram OTP Bot</b>
 
@@ -70,7 +71,7 @@ Bot is running and monitoring every 60 seconds.
 
     await update.message.reply_text(welcome_message, parse_mode='HTML')
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status command"""
     uptime = datetime.now() - bot_stats['start_time']
     uptime_str = str(uptime).split('.')[0]
@@ -88,7 +89,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = get_status_message(status_data)
     await update.message.reply_text(status_msg, parse_mode='HTML')
 
-async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /check command - manually check for OTPs"""
     await update.message.reply_text("🔍 <b>Checking for new OTPs...</b>", parse_mode='HTML')
     
@@ -106,7 +107,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def test_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /test command - send test message"""
     test_otp = {
         'otp': '123456',
@@ -133,7 +134,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stats_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stats command - detailed statistics"""
     uptime = datetime.now() - bot_stats['start_time']
     uptime_str = str(uptime).split('.')[0]
@@ -209,6 +210,20 @@ def initialize_bot():
         bot_stats['last_error'] = str(e)
         return False
 
+async def async_send_message(message, parse_mode='HTML'):
+    """Async function to send message to Telegram"""
+    try:
+        await bot.send_message(
+            chat_id=GROUP_ID,
+            text=message,
+            parse_mode=parse_mode
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+        bot_stats['last_error'] = str(e)
+        return False
+
 def send_telegram_message(message, parse_mode='HTML'):
     """Send message to Telegram group"""
     try:
@@ -216,23 +231,22 @@ def send_telegram_message(message, parse_mode='HTML'):
             logger.error("Bot or Group ID not configured")
             return False
         
-        # Use asyncio to run the async function
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Try to use existing event loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         
-        async def send_message():
-            await bot.send_message(
-                chat_id=GROUP_ID,
-                text=message,
-                parse_mode=parse_mode
-            )
-        
-        loop.run_until_complete(send_message())
-        loop.close()
-        
-        logger.info("Message sent to Telegram successfully")
-        return True
-        
+        # Run the async function
+        if loop.is_running():
+            # If loop is running, create a task
+            asyncio.create_task(async_send_message(message, parse_mode))
+            return True
+        else:
+            # Otherwise run until complete
+            return loop.run_until_complete(async_send_message(message, parse_mode))
+            
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
         bot_stats['last_error'] = str(e)
@@ -243,12 +257,30 @@ def start_telegram_bot():
     if telegram_app:
         logger.info("Starting Telegram command handlers...")
         try:
-            # Run the bot in a separate thread
             def run_bot():
-                asyncio.set_event_loop(asyncio.new_event_loop())
-                telegram_app.run_polling(drop_pending_updates=True)
+                # Create new event loop for this thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                try:
+                    # Run the bot with proper cleanup
+                    telegram_app.run_polling(
+                        drop_pending_updates=True,
+                        close_loop=False,
+                        stop_signals=None
+                    )
+                except Exception as e:
+                    logger.error(f"Bot polling error: {e}")
+                finally:
+                    if loop.is_running():
+                        loop.stop()
+                    loop.close()
             
-            bot_thread = threading.Thread(target=run_bot, daemon=True)
+            bot_thread = threading.Thread(
+                target=run_bot,
+                daemon=True,
+                name="TelegramBotThread"
+            )
             bot_thread.start()
             logger.info("Telegram bot polling started")
         except Exception as e:
@@ -307,27 +339,26 @@ def background_monitor():
     while bot_stats['is_running']:
         try:
             check_and_send_otps()
-            # Wait 60 seconds before next check
-            time.sleep(60)
-            
         except Exception as e:
             logger.error(f"Error in background monitor: {e}")
             bot_stats['last_error'] = str(e)
-            # Wait longer on error
-            time.sleep(120)
+        
+        # Wait with periodic checks for shutdown
+        wait_time = 120 if bot_stats['last_error'] else 60
+        for _ in range(wait_time):
+            if not bot_stats['is_running']:
+                return
+            time.sleep(1)
 
 # Flask routes
 @app.route('/')
 def home():
     """Home route - serve dashboard or JSON based on Accept header"""
-    # Check if request wants HTML (browser) or JSON (API)
     if 'text/html' in request.headers.get('Accept', ''):
-        # Serve HTML dashboard for browsers
         return render_template('dashboard.html')
     
-    # Serve JSON for API calls
     uptime = datetime.now() - bot_stats['start_time']
-    uptime_str = str(uptime).split('.')[0]  # Remove microseconds
+    uptime_str = str(uptime).split('.')[0]
     
     status = {
         'status': 'running',
@@ -376,7 +407,6 @@ def bot_status():
     message = get_status_message(status)
     
     if request.args.get('send') == 'true':
-        # Send status to Telegram
         if send_telegram_message(message):
             return jsonify({'status': 'success', 'message': 'Status sent to Telegram'})
         else:
@@ -419,7 +449,11 @@ def start_monitor():
         return jsonify({'status': 'info', 'message': 'Monitor already running'})
     
     try:
-        monitor_thread = threading.Thread(target=background_monitor, daemon=True)
+        monitor_thread = threading.Thread(
+            target=background_monitor,
+            daemon=True,
+            name="OTPMonitorThread"
+        )
         monitor_thread.start()
         return jsonify({'status': 'success', 'message': 'Background monitor started'})
     except Exception as e:
@@ -441,8 +475,23 @@ def not_found(error):
 def internal_error(error):
     return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
+def shutdown_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    logger.info(f"Received signal {signum}, shutting down...")
+    bot_stats['is_running'] = False
+    
+    if telegram_app:
+        logger.info("Stopping Telegram bot...")
+        telegram_app.stop()
+    
+    exit(0)
+
 def main():
     """Main function to start the bot"""
+    # Register signal handlers
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    
     logger.info("Starting Telegram OTP Bot...")
     
     # Initialize bot and scraper
@@ -453,8 +502,9 @@ def main():
     # Start Telegram command handlers
     start_telegram_bot()
     
-    # Send startup message
-    startup_message = """🚀 <b>Bot Started Successfully!</b>
+    # Send startup message in background
+    def send_startup():
+        startup_message = """🚀 <b>Bot Started Successfully!</b>
 
 ✅ IVASMS scraper initialized
 ✅ Telegram bot connected
@@ -469,18 +519,32 @@ def main():
 /stats - Detailed statistics
 
 <i>Bot is now running and will automatically send new OTPs to this group.</i>"""
+        
+        for attempt in range(3):
+            if send_telegram_message(startup_message):
+                break
+            time.sleep(2)
     
-    send_telegram_message(startup_message)
+    threading.Thread(target=send_startup, daemon=True).start()
     
     # Start background monitor
-    monitor_thread = threading.Thread(target=background_monitor, daemon=True)
+    monitor_thread = threading.Thread(
+        target=background_monitor,
+        daemon=True,
+        name="OTPMonitorThread"
+    )
     monitor_thread.start()
     
     # Get port for deployment
     port = int(os.environ.get('PORT', 5000))
     
     logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=False,
+        use_reloader=False  # Disable reloader as it doesn't work well with threads
+    )
 
 if __name__ == '__main__':
     main()
